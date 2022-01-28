@@ -18,25 +18,25 @@
 
 package com.tencent.shadow.core.gradle
 
-import com.android.build.gradle.AppPlugin
+import com.android.build.gradle.AppExtension
 import com.android.build.gradle.BaseExtension
 import com.tencent.shadow.core.gradle.extensions.PackagePluginExtension
+import com.tencent.shadow.core.manifest_parser.generatePluginManifest
 import com.tencent.shadow.core.transform.ShadowTransform
 import com.tencent.shadow.core.transform_kit.AndroidClassPoolBuilder
 import com.tencent.shadow.core.transform_kit.ClassPoolBuilder
 import org.gradle.api.*
-import org.gradle.api.plugins.BasePlugin
 import java.io.File
-import kotlin.reflect.full.declaredFunctions
-import kotlin.reflect.jvm.isAccessible
 
 class ShadowPlugin : Plugin<Project> {
 
     private lateinit var androidClassPoolBuilder: ClassPoolBuilder
     private lateinit var contextClassLoader: ClassLoader
+    private lateinit var agpCompat: AGPCompat
 
     override fun apply(project: Project) {
-        val baseExtension = getBaseExtension(project)
+        agpCompat = buildAgpCompat(project)
+        val baseExtension = project.extensions.getByName("android") as BaseExtension
 
         //在这里取到的contextClassLoader包含运行时库(classpath方式引入的)shadow-runtime
         contextClassLoader = Thread.currentThread().contextClassLoader
@@ -61,6 +61,21 @@ class ShadowPlugin : Plugin<Project> {
             initAndroidClassPoolBuilder(baseExtension, project)
 
             createPackagePluginTasks(project)
+
+            createGeneratePluginManifestTasks(project)
+        }
+
+        checkKotlinAndroidPluginForPluginManifestTask(project)
+    }
+
+    /**
+     * GeneratePluginManifestTask会向android DSL添加新的java源码目录，
+     * 而kotlin-android会在syncKotlinAndAndroidSourceSets中接管java的源码目录，
+     * 从而使后添加到android DSL中的java目录失效。
+     */
+    private fun checkKotlinAndroidPluginForPluginManifestTask(project: Project) {
+        if (project.plugins.hasPlugin("kotlin-android")) {
+            throw Error("必须在kotlin-android之前应用com.tencent.shadow.plugin")
         }
     }
 
@@ -71,7 +86,7 @@ class ShadowPlugin : Plugin<Project> {
 
         val tasks = mutableListOf<Task>()
         for (i in buildTypes) {
-            println("buildTypes = " + i.name)
+            project.logger.info("buildTypes = " + i.name)
             val task = createPackagePluginTask(project, i)
             tasks.add(task)
         }
@@ -83,16 +98,54 @@ class ShadowPlugin : Plugin<Project> {
         }
     }
 
+    private fun createGeneratePluginManifestTasks(project: Project) {
+        val appExtension: AppExtension = project.extensions.getByType(AppExtension::class.java)
+        appExtension.applicationVariants.filter { variant ->
+            variant.productFlavors.any { flavor ->
+                flavor.dimension == ShadowTransform.DimensionName &&
+                        flavor.name == ShadowTransform.ApplyShadowTransformFlavorName
+            }
+        }.forEach { pluginVariant ->
+            val output = pluginVariant.outputs.first()
+            val processManifestTask = agpCompat.getProcessManifestTask(output)
+            val manifestFile = agpCompat.getManifestFile(processManifestTask)
+            val variantName = pluginVariant.name
+            val outputDir = File(project.buildDir, "generated/source/pluginManifest/$variantName")
+
+            // 添加生成PluginManifest.java任务
+            val task = project.tasks.register("generate${variantName.capitalize()}PluginManifest") {
+                it.dependsOn(processManifestTask)
+                it.inputs.file(manifestFile)
+                it.outputs.dir(outputDir).withPropertyName("outputDir")
+
+                val packageForR = agpCompat.getPackageForR(project, variantName)
+
+                it.doLast {
+                    generatePluginManifest(
+                        manifestFile,
+                        outputDir,
+                        "com.tencent.shadow.core.manifest_parser",
+                        packageForR
+                    )
+                }
+            }
+            project.tasks.getByName("compile${variantName.capitalize()}JavaWithJavac").dependsOn(task)
+
+            // 把PluginManifest.java添加为源码
+            appExtension.sourceSets.getByName(variantName).java.srcDir(outputDir)
+        }
+    }
+
     private fun addFlavorForTransform(baseExtension: BaseExtension) {
-        baseExtension.flavorDimensionList.add(ShadowTransform.DimensionName)
+        agpCompat.addFlavorDimension(baseExtension, ShadowTransform.DimensionName)
         try {
             baseExtension.productFlavors.create(ShadowTransform.NoShadowTransformFlavorName) {
                 it.dimension = ShadowTransform.DimensionName
-                it.isDefault = true
+                agpCompat.setProductFlavorDefault(it, true)
             }
             baseExtension.productFlavors.create(ShadowTransform.ApplyShadowTransformFlavorName) {
                 it.dimension = ShadowTransform.DimensionName
-                it.isDefault = false
+                agpCompat.setProductFlavorDefault(it, false)
             }
         } catch (e: InvalidUserDataException) {
             throw Error("请在android{} DSL之前apply plugin: 'com.tencent.shadow.plugin'", e)
@@ -123,14 +176,9 @@ class ShadowPlugin : Plugin<Project> {
         var useHostContext: Array<String> = emptyArray()
     }
 
-    fun getBaseExtension(project: Project): BaseExtension {
-        val plugin = project.plugins.getPlugin(AppPlugin::class.java)
-        if (com.android.builder.model.Version.ANDROID_GRADLE_PLUGIN_VERSION == "3.0.0") {
-            val method = BasePlugin::class.declaredFunctions.first { it.name == "getExtension" }
-            method.isAccessible = true
-            return method.call(plugin) as BaseExtension
-        } else {
-            return project.extensions.getByName("android") as BaseExtension
+    companion object {
+        private fun buildAgpCompat(project: Project): AGPCompat {
+            return AGPCompatImpl()
         }
     }
 

@@ -19,6 +19,7 @@
 package com.tencent.shadow.core.loader.classloaders
 
 import android.os.Build
+import com.tencent.shadow.core.runtime.PluginManifest
 import dalvik.system.BaseDexClassLoader
 import org.jetbrains.annotations.TestOnly
 import java.io.File
@@ -109,6 +110,18 @@ class PluginClassLoader(
         }
 
         return clazz
+    }
+
+    internal fun loadPluginManifest(): PluginManifest {
+        try {
+            val clazz = findClass("com.tencent.shadow.core.manifest_parser.PluginManifest")
+            return PluginManifest::class.java.cast(clazz.newInstance())
+        } catch (e: ClassNotFoundException) {
+            throw Error(
+                "请注意每个插件apk构建时都需要" +
+                        "apply plugin: 'com.tencent.shadow.plugin'", e
+            )
+        }
     }
 
 }
